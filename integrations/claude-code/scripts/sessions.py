@@ -491,6 +491,103 @@ async def update_summary_snapshot(
     return True
 
 
+# ─── LLM auto-naming ──────────────────────────────────────────────────────
+
+
+_AUTO_RENAME_AT_TURN = 5
+_AUTO_RENAME_PROMPT = (
+    "Read the recent conversation between the user and the AI assistant below "
+    "and produce a short label (4 to 7 words) that captures what the user is "
+    "working on. Use Title Case, no quotes, no trailing punctuation. Output "
+    "ONLY the label — no preface, no commentary."
+)
+
+
+async def _fetch_recent_qa(session_id: str, limit: int = 10) -> List[dict]:
+    """Pull recent QA entries from cognee's session cache for naming context."""
+    try:
+        import cognee
+
+        results = await cognee.session.get_session(
+            session_id=session_id, last_n=limit, formatted=False
+        )
+        return list(results) if results else []
+    except Exception:
+        return []
+
+
+def _format_qa_for_naming(entries: List[dict]) -> str:
+    parts: List[str] = []
+    for e in entries:
+        if not isinstance(e, dict):
+            continue
+        q = str(e.get("question") or "").strip()
+        a = str(e.get("answer") or "").strip()
+        if q:
+            parts.append(f"User: {q[:300]}")
+        if a:
+            parts.append(f"AI: {a[:300]}")
+    return "\n".join(parts).strip()
+
+
+async def _llm_label_from_text(blob: str) -> Optional[str]:
+    """Call litellm.acompletion with the cognee-configured provider for a label."""
+    if not blob:
+        return None
+    import litellm
+    from cognee.infrastructure.llm import get_llm_config
+
+    cfg = get_llm_config()
+    try:
+        resp = await litellm.acompletion(
+            model=cfg.llm_model,
+            messages=[
+                {"role": "system", "content": _AUTO_RENAME_PROMPT},
+                {"role": "user", "content": blob},
+            ],
+            max_tokens=40,
+            temperature=0.2,
+        )
+    except Exception:
+        return None
+    try:
+        text = resp.choices[0].message.content or ""
+    except Exception:
+        return None
+    label = text.strip().strip('"').strip("'").strip()
+    label = label.split("\n", 1)[0].strip()
+    if not (3 <= len(label) <= 80):
+        return None
+    return label
+
+
+async def auto_rename_if_due(project_hash: str) -> Optional["Session"]:
+    """Rename the active session via Bedrock if it's still ``auto_named`` and
+    has just hit the threshold turn count.
+
+    No-ops in any of these cases:
+      - no active session
+      - active session has ``auto_named=False`` (user has set a sticky label)
+      - turn_count != ``_AUTO_RENAME_AT_TURN`` (one-shot trigger)
+      - LLM call returns empty / overlong / errors
+    """
+    active = await find_active_session(project_hash)
+    if not active or not active.auto_named:
+        return None
+    if int(active.turn_count or 0) != _AUTO_RENAME_AT_TURN:
+        return None
+
+    qa = await _fetch_recent_qa(str(active.id))
+    blob = _format_qa_for_naming(qa)
+    if not blob:
+        return None
+
+    label = await _llm_label_from_text(blob)
+    if not label:
+        return None
+    return await rename_session(project_hash, str(active.id), label, by_user=False)
+
+
 async def ensure_active_session(
     project_hash: str,
     project_root: str,

@@ -240,6 +240,24 @@ async def _store_assistant_stop(payload: dict) -> None:
         if should_improve:
             await _fire_improve_background(dataset, session_id, user, reason=f"turn_{count}")
 
+        # Bump session turn_count + maybe auto-rename. Best-effort; failures
+        # never block the Stop hook.
+        try:
+            import sessions as _S
+
+            cwd = os.environ.get("CLAUDE_CWD", os.getcwd())
+            project_hash = _S.compute_project_hash(cwd)
+            await _S.increment_turn(project_hash)
+            renamed = await _S.auto_rename_if_due(project_hash)
+            if renamed:
+                hook_log(
+                    "session_auto_renamed",
+                    {"new_label": renamed.label, "session": str(renamed.id)},
+                )
+                notify(f"session auto-renamed → {renamed.label}")
+        except Exception as exc:
+            hook_log("session_post_stop_error", {"error": str(exc)[:200]})
+
 
 def main():
     payload_raw = sys.stdin.read()
