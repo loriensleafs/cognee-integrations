@@ -166,6 +166,7 @@ async def _store_tool_call(payload: dict) -> None:
             entry,
             dataset_name=dataset,
             session_id=session_id,
+            node_set=[session_id],
             user=user,
         )
     except Exception as exc:
@@ -223,6 +224,7 @@ async def _store_assistant_stop(payload: dict) -> None:
             entry,
             dataset_name=dataset,
             session_id=session_id,
+            node_set=[session_id],
             user=user,
         )
     except Exception as exc:

@@ -1,21 +1,31 @@
-"""Session management — backed by cognee custom DataPoints + nodesets.
+"""Session management — backed by cognee custom DataPoints.
 
-Mapping:
+Domain model:
 
-    Project   →  cognee dataset (``project_<hash>``)
-    Session   →  custom ``Session`` DataPoint
-    Status    →  NodeSet (``IN_PROGRESS`` | ``ENDED``) — mutually exclusive
-    Active    →  NodeSet (``ACTIVE``) — at most one per project
-    Branch    →  NodeSet (``branch_<name>``)
+    Project DataPoint   ──:project──   Session DataPoint
+    {name, project_hash}                 {label, status, is_active,
+                                          started_at, ended_at, git_branch,
+                                          summary_snapshot, auto_named,
+                                          turn_count}
 
-Source of truth is the cognee graph; all writes go through ``add_data_points``
-which upserts by UUID. Readers hit the hot-path cache at
-``~/.cognee-plugin/projects/<hash>/active.json`` so per-prompt hooks never
-require a cognee round-trip just to read the active session id.
+The Session's lifecycle and selection state live as **fields**, not nodeset
+membership: ``status='IN_PROGRESS'|'ENDED'`` and ``is_active=true|false``.
+This makes Cypher queries column-level rather than list-contains, and is
+the pattern recommended in the cognee docs' "Session as first-class
+entity" guide.
 
-The cache is rewritten on every state change and reconciled against cognee at
-SessionStart. If the cache is corrupt or missing, callers can ``await
-ensure_active_session`` to rehydrate from cognee.
+Project association is a real graph edge (Session.project → Project), so
+we can traverse ``MATCH (s:Session)-[:project]->(p:Project {...})``
+naturally instead of stuffing project membership into a string nodeset.
+
+Content ingestion (cognee.remember / cognee.add) is tagged with
+``node_set=[session_id]`` at the call site so chunks and entities cognee
+extracts inherit the session scope. That gives recall a graph-level
+filter, not just a QA-cache filter.
+
+Source of truth is the cognee graph; a tiny ``active.json`` cache holds
+just the active session id + dataset + project_hash so per-prompt hooks
+don't need a graph query to find the active session.
 """
 
 from __future__ import annotations
@@ -28,8 +38,10 @@ import secrets
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import Any, List, Literal, Optional
 from uuid import UUID, uuid4
+
+from pydantic import SkipValidation
 
 from cognee.infrastructure.engine import DataPoint
 from cognee.tasks.storage import add_data_points
@@ -38,30 +50,46 @@ _PLUGIN_ROOT = Path.home() / ".cognee-plugin"
 _PROJECTS_ROOT = _PLUGIN_ROOT / "projects"
 
 
-# ─── Custom DataPoint ─────────────────────────────────────────────────────
+# ─── Custom DataPoints ────────────────────────────────────────────────────
+
+
+class Project(DataPoint):
+    """Logical container for a project's sessions.
+
+    ``project_hash`` is the identity field — same hash deterministically
+    produces the same UUID, so ``add_data_points`` upserts cleanly across
+    runs without us tracking which projects have been created.
+    """
+
+    name: str = ""
+    project_hash: str = ""
+    metadata: dict = {
+        "index_fields": ["name"],
+        "identity_fields": ["project_hash"],
+    }
 
 
 class Session(DataPoint):
     """A unit of work within a project, with explicit lifecycle.
 
-    ``id`` is inherited from ``DataPoint`` (UUID). The cognee ``session_id``
-    parameter on ``remember``/``recall`` calls is the string form of this UUID.
+    ``str(self.id)`` is what we pass as cognee's ``session_id`` filter
+    parameter and what we use as the ``node_set`` tag on content ingestion.
     """
 
     label: str = ""
+    status: Literal["IN_PROGRESS", "ENDED"] = "IN_PROGRESS"
+    is_active: bool = False
     started_at: str = ""
     ended_at: Optional[str] = None
     git_branch: str = ""
     summary_snapshot: str = ""
     auto_named: bool = True
     turn_count: int = 0
+
+    # Edge field — assigning a Project instance creates a (Session)-[:project]->(Project) edge.
+    project: SkipValidation[Any] = None
+
     metadata: dict = {"index_fields": ["label", "summary_snapshot"]}
-
-
-# NodeSet names used as belongs_to_set markers.
-NS_ACTIVE = "ACTIVE"
-NS_IN_PROGRESS = "IN_PROGRESS"
-NS_ENDED = "ENDED"
 
 
 # ─── Stateless helpers ────────────────────────────────────────────────────
@@ -69,10 +97,6 @@ NS_ENDED = "ENDED"
 
 def _now() -> str:
     return _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-def _short(session_id: str) -> str:
-    return session_id[:8]
 
 
 def compute_project_hash(cwd: Optional[str] = None) -> str:
@@ -86,19 +110,6 @@ def compute_project_hash(cwd: Optional[str] = None) -> str:
 def dataset_name(project_hash: str) -> str:
     """Cognee dataset name for a project."""
     return f"project_{project_hash}"
-
-
-def project_nodeset(project_hash: str) -> str:
-    """NodeSet tagging items as belonging to this project."""
-    return f"project_{project_hash}"
-
-
-def branch_nodeset(branch: str) -> Optional[str]:
-    """NodeSet tagging items as related to a git branch."""
-    if not branch:
-        return None
-    sanitized = branch.replace("/", "-").replace(" ", "-")[:40]
-    return f"branch_{sanitized}"
 
 
 def get_git_branch(cwd: str) -> str:
@@ -171,19 +182,14 @@ def clear_cache(project_hash: str) -> None:
         pass
 
 
-# ─── Cognee-backed operations ─────────────────────────────────────────────
+# ─── Cognee dataset + permissions ─────────────────────────────────────────
 
 
 _AGENT_EMAIL = "claude-code@cognee.agent"
 
 
 async def _get_agent_user():
-    """Return the agent User (claude-code@cognee.agent), or default if unavailable.
-
-    The Cognee Claude Code plugin operates under a dedicated agent identity
-    registered in ``ensure_identity``. Sessions DataPoints + datasets must be
-    owned and queried by that same user to avoid permission mismatches.
-    """
+    """Return the agent User (claude-code@cognee.agent), or default if unavailable."""
     from cognee.modules.users.methods import get_default_user, get_user_by_email
 
     user = await get_user_by_email(_AGENT_EMAIL)
@@ -193,13 +199,8 @@ async def _get_agent_user():
 
 
 async def _ensure_dataset(project_hash: str) -> None:
-    """Idempotently create the project's cognee dataset and grant the agent
-    user read/write/delete/share permissions on it.
-
-    ``add_data_points`` writes graph nodes but does *not* register the dataset
-    in cognee's relational metadata, so a fresh project would 404 on
-    ``cognee.search``. Permission grants are required for the agent user to
-    query the dataset back later.
+    """Idempotently create the project's cognee dataset and grant the agent user
+    read/write/delete/share permissions on it.
     """
     from cognee.modules.data.methods.create_dataset import create_dataset
     from cognee.modules.users.permissions.methods import give_permission_on_dataset
@@ -212,8 +213,20 @@ async def _ensure_dataset(project_hash: str) -> None:
         try:
             await give_permission_on_dataset(user, dataset.id, perm)
         except Exception:
-            # Idempotent: ACL already exists, etc.
             pass
+
+
+# ─── Project upsert ───────────────────────────────────────────────────────
+
+
+async def get_or_create_project(project_hash: str, project_root: str) -> "Project":
+    """Idempotent: same project_hash deterministically produces same Project UUID."""
+    project = Project(name=Path(project_root).name or project_root, project_hash=project_hash)
+    await add_data_points([project])
+    return project
+
+
+# ─── Cognee-backed session queries ────────────────────────────────────────
 
 
 def _props_to_session(props: dict) -> Optional["Session"]:
@@ -224,13 +237,14 @@ def _props_to_session(props: dict) -> Optional["Session"]:
         return Session(
             id=UUID(str(props["id"])) if "id" in props else uuid4(),
             label=str(props.get("label", "")),
+            status=str(props.get("status", "IN_PROGRESS")),
+            is_active=bool(props.get("is_active", False)),
             started_at=str(props.get("started_at", "")),
             ended_at=props.get("ended_at"),
             git_branch=str(props.get("git_branch", "")),
             summary_snapshot=str(props.get("summary_snapshot", "")),
             auto_named=bool(props.get("auto_named", True)),
             turn_count=int(props.get("turn_count", 0)),
-            belongs_to_set=list(props.get("belongs_to_set") or []),
             created_at=int(props.get("created_at", 0)),
             updated_at=int(props.get("updated_at", 0)),
         )
@@ -239,42 +253,37 @@ def _props_to_session(props: dict) -> Optional["Session"]:
 
 
 async def _query_sessions(
-    project_hash: str,
-    nodesets: List[str],
-    query_text: str = "session",  # retained for signature compat; unused
-    top_k: int = 50,
+    project_hash: str, *, where: str = "", params: Optional[dict] = None, limit: int = 50
 ) -> List["Session"]:
-    """Find Session DataPoints filtered by nodeset membership.
+    """Find Session DataPoints linked to this project via the :project edge.
 
-    Uses direct Cypher via the graph engine because ``cognee.search`` with
-    ``query_type=CHUNKS`` returns vector-index rows (IndexSchema), not the
-    underlying DataPoint instances. The Cypher ``ALL`` predicate matches the
-    AND semantics we want: a session must have every requested nodeset plus
-    the project nodeset.
+    ``where`` is appended to the base ``MATCH ... WHERE`` clause for status /
+    activity filtering. ``params`` extends the base parameter dict.
     """
     from cognee.infrastructure.databases.graph import get_graph_engine
 
     await _ensure_dataset(project_hash)
 
-    required = list(nodesets) + [project_nodeset(project_hash)]
-
+    base_where = "p.project_hash = $project_hash"
+    full_where = f"{base_where} AND ({where})" if where else base_where
     cypher = (
-        "MATCH (n) "
-        "WHERE n.type = 'Session' "
-        "AND ALL(ns IN $required WHERE ns IN n.belongs_to_set) "
-        "RETURN properties(n) AS props "
-        f"LIMIT {int(top_k)}"
+        "MATCH (s)-[:project]->(p) "
+        "WHERE s.type = 'Session' AND p.type = 'Project' "
+        f"AND {full_where} "
+        "RETURN properties(s) AS props "
+        f"LIMIT {int(limit)}"
     )
+    full_params = {"project_hash": project_hash, **(params or {})}
 
     try:
         engine = await get_graph_engine()
-        rows = await engine.query(cypher, {"required": required})
+        rows = await engine.query(cypher, full_params)
     except Exception:
         return []
 
     sessions: List[Session] = []
     for row in rows or []:
-        props = row.get("props") if isinstance(row, dict) else row[0] if row else None
+        props = row.get("props") if isinstance(row, dict) else (row[0] if row else None)
         s = _props_to_session(props)
         if s is not None:
             sessions.append(s)
@@ -282,22 +291,41 @@ async def _query_sessions(
 
 
 async def find_active_session(project_hash: str) -> Optional["Session"]:
-    """Cognee query for the project's active session."""
-    sessions = await _query_sessions(project_hash, [NS_ACTIVE], top_k=1)
+    """The session with ``is_active=true`` for this project, or None."""
+    sessions = await _query_sessions(
+        project_hash, where="s.is_active = true", limit=1
+    )
     return sessions[0] if sessions else None
 
 
 async def find_in_progress_sessions(project_hash: str) -> List["Session"]:
-    """All sessions tagged IN_PROGRESS in this project."""
-    return await _query_sessions(project_hash, [NS_IN_PROGRESS], top_k=50)
+    """Sessions with ``status='IN_PROGRESS'`` for this project."""
+    return await _query_sessions(
+        project_hash, where="s.status = 'IN_PROGRESS'", limit=50
+    )
 
 
 async def find_session_by_natural_language(
     project_hash: str, query: str, in_progress_only: bool = True
 ) -> List["Session"]:
-    """Semantic match against Session label/summary. Returns top-5 matches."""
-    nodesets = [NS_IN_PROGRESS] if in_progress_only else []
-    return await _query_sessions(project_hash, nodesets, query_text=query, top_k=5)
+    """Substring-match against Session label / summary in this project.
+
+    For in-progress narrowing, filter on ``status``. The ``query`` is
+    matched case-insensitively against ``label`` and ``summary_snapshot``.
+    A real semantic search would use cognee's vector index over the
+    indexed fields; for V1 this string-match is enough for typical NL
+    descriptions.
+    """
+    where_parts = []
+    params = {"q": (query or "").lower()}
+    if in_progress_only:
+        where_parts.append("s.status = 'IN_PROGRESS'")
+    where_parts.append(
+        "(toLower(s.label) CONTAINS $q OR toLower(s.summary_snapshot) CONTAINS $q)"
+    )
+    return await _query_sessions(
+        project_hash, where=" AND ".join(where_parts), params=params, limit=10
+    )
 
 
 async def find_session_by_id(
@@ -305,15 +333,16 @@ async def find_session_by_id(
 ) -> Optional["Session"]:
     """Lookup Session by full or short UUID prefix.
 
-    Searches in-progress first, then ended. Comparison is on str(uuid).
+    Searches in-progress first, then ended.
     """
     candidates = await find_in_progress_sessions(project_hash)
     for s in candidates:
         sid = str(s.id)
         if sid == session_id or sid.startswith(session_id):
             return s
-    # Fallback: ENDED sessions
-    candidates = await _query_sessions(project_hash, [NS_ENDED], top_k=50)
+    candidates = await _query_sessions(
+        project_hash, where="s.status = 'ENDED'", limit=50
+    )
     for s in candidates:
         sid = str(s.id)
         if sid == session_id or sid.startswith(session_id):
@@ -321,8 +350,11 @@ async def find_session_by_id(
     return None
 
 
+# ─── Lifecycle writes ─────────────────────────────────────────────────────
+
+
 async def _persist(session: "Session") -> "Session":
-    """Upsert the Session DataPoint via add_data_points (UUID-based dedup)."""
+    """Upsert via add_data_points (UUID-based dedup)."""
     session.updated_at = int(_dt.datetime.now(_dt.timezone.utc).timestamp() * 1000)
     await add_data_points([session])
     return session
@@ -335,35 +367,31 @@ async def create_session(
     git_branch: str = "",
     set_active_flag: bool = True,
 ) -> "Session":
-    """Create a new Session and persist to cognee. Optionally marks it active."""
+    """Create a new Session linked to its Project. Optionally mark active."""
     auto_named = not bool(label)
     if not label:
-        # Generate a placeholder; replaced by LLM rename after enough turns.
         label = f"untitled-{secrets.token_hex(4)}"
 
-    belongs = [NS_IN_PROGRESS, project_nodeset(project_hash)]
-    bn = branch_nodeset(git_branch)
-    if bn:
-        belongs.append(bn)
+    project = await get_or_create_project(project_hash, project_root)
 
     if set_active_flag:
         # Demote any existing ACTIVE in this project before promoting ours.
         existing = await find_active_session(project_hash)
         if existing:
-            existing.belongs_to_set = [
-                s for s in (existing.belongs_to_set or []) if s != NS_ACTIVE
-            ]
+            existing.is_active = False
             await _persist(existing)
-        belongs.append(NS_ACTIVE)
 
     session = Session(
         label=label,
+        status="IN_PROGRESS",
+        is_active=bool(set_active_flag),
         started_at=_now(),
         git_branch=git_branch,
         auto_named=auto_named,
-        belongs_to_set=belongs,
     )
-    await _persist(session)
+    session.project = project  # creates (Session)-[:project]->(Project) edge
+
+    await add_data_points([session])
 
     if set_active_flag:
         write_cache(project_hash, session, project_root)
@@ -373,7 +401,7 @@ async def create_session(
 async def set_active(
     project_hash: str, target_id: str, project_root: str
 ) -> Optional["Session"]:
-    """Move ACTIVE nodeset from current to target. Updates cache."""
+    """Move active flag from current to target. Updates cache."""
     target = await find_session_by_id(project_hash, target_id)
     if not target:
         raise ValueError(f"session not found: {target_id}")
@@ -384,15 +412,10 @@ async def set_active(
         return target
 
     if current:
-        current.belongs_to_set = [
-            s for s in (current.belongs_to_set or []) if s != NS_ACTIVE
-        ]
+        current.is_active = False
         await _persist(current)
 
-    target_belongs = list(target.belongs_to_set or [])
-    if NS_ACTIVE not in target_belongs:
-        target_belongs.append(NS_ACTIVE)
-    target.belongs_to_set = target_belongs
+    target.is_active = True
     await _persist(target)
 
     write_cache(project_hash, target, project_root)
@@ -402,7 +425,7 @@ async def set_active(
 async def end_session(
     project_hash: str, session_id: Optional[str] = None
 ) -> Optional["Session"]:
-    """End a session (defaults to active). Removes IN_PROGRESS+ACTIVE, adds ENDED."""
+    """End a session (defaults to active). Sets status='ENDED', is_active=false, ended_at=now."""
     if session_id:
         session = await find_session_by_id(project_hash, session_id)
     else:
@@ -410,16 +433,11 @@ async def end_session(
     if not session:
         return None
 
-    new_belongs = [
-        s for s in (session.belongs_to_set or []) if s not in (NS_ACTIVE, NS_IN_PROGRESS)
-    ]
-    if NS_ENDED not in new_belongs:
-        new_belongs.append(NS_ENDED)
-    session.belongs_to_set = new_belongs
+    session.status = "ENDED"
+    session.is_active = False
     session.ended_at = _now()
     await _persist(session)
 
-    # Active pointer cleared if the ended session was active.
     cache = read_cache(project_hash)
     if cache and cache.get("session_id") == str(session.id):
         clear_cache(project_hash)
@@ -445,11 +463,9 @@ async def rename_session(
         session.auto_named = False
     await _persist(session)
 
-    # Refresh cached label if this is the active session.
     cache = read_cache(project_hash)
     if cache and cache.get("session_id") == str(session.id):
         cache["session_label"] = label
-        # Re-write atomically using existing payload
         path = _cache_path(project_hash)
         path.write_text(json.dumps(cache, indent=2) + "\n", encoding="utf-8")
     return session
@@ -458,7 +474,7 @@ async def rename_session(
 async def increment_turn(
     project_hash: str, session_id: Optional[str] = None
 ) -> Optional[int]:
-    """Bump turn_count on a session. Returns new count."""
+    """Bump turn_count. Returns new count."""
     if session_id:
         session = await find_session_by_id(project_hash, session_id)
     else:
@@ -473,7 +489,7 @@ async def increment_turn(
 async def update_summary_snapshot(
     project_hash: str, snapshot: str, session_id: Optional[str] = None
 ) -> bool:
-    """Write a fresh summary_snapshot to a session. Updates cache if active."""
+    """Write a fresh summary_snapshot. Updates cache if active."""
     if session_id:
         session = await find_session_by_id(project_hash, session_id)
     else:
@@ -564,12 +580,6 @@ async def _llm_label_from_text(blob: str) -> Optional[str]:
 async def auto_rename_if_due(project_hash: str) -> Optional["Session"]:
     """Rename the active session via Bedrock if it's still ``auto_named`` and
     has just hit the threshold turn count.
-
-    No-ops in any of these cases:
-      - no active session
-      - active session has ``auto_named=False`` (user has set a sticky label)
-      - turn_count != ``_AUTO_RENAME_AT_TURN`` (one-shot trigger)
-      - LLM call returns empty / overlong / errors
     """
     active = await find_active_session(project_hash)
     if not active or not active.auto_named:
@@ -588,6 +598,9 @@ async def auto_rename_if_due(project_hash: str) -> Optional["Session"]:
     return await rename_session(project_hash, str(active.id), label, by_user=False)
 
 
+# ─── Bootstrap ────────────────────────────────────────────────────────────
+
+
 async def ensure_active_session(
     project_hash: str,
     project_root: str,
@@ -597,29 +610,21 @@ async def ensure_active_session(
 
     Read order: cache (fast) → cognee (source of truth) → create (last resort).
     """
-    # Fast path: trust cache
     cache = read_cache(project_hash)
     if cache and cache.get("session_id"):
-        # We don't fully reconstruct the Session here — caller usually only
-        # needs the id and label, both of which are in cache. If the caller
-        # needs the full DataPoint, they should explicitly call find_active_session.
-        # But for safety, look up cognee to get the live record.
         try:
             uid = UUID(cache["session_id"])
             for s in await find_in_progress_sessions(project_hash):
-                if s.id == uid:
+                if s.id == uid and s.is_active:
                     return s
         except Exception:
             pass
-        # Cache is stale; fall through to cognee query.
 
-    # Cognee query
     active = await find_active_session(project_hash)
     if active:
         write_cache(project_hash, active, project_root)
         return active
 
-    # Create placeholder
     return await create_session(
         project_hash, project_root, git_branch=git_branch, set_active_flag=True
     )
