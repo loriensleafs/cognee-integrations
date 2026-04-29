@@ -140,29 +140,64 @@ async def _start():
     except Exception as e:
         print(f"cognee-plugin: identity warning ({e})", file=sys.stderr)
 
-    # Resolve the active session for this project. Auto-creates an
-    # ``untitled-<short>`` placeholder on first cwd visit.
+    # Resolve the active project + session. Resolver order:
+    #   1. Sticky active-project pointer (set by /cognee-memory:project-activate
+    #      or a prior SessionStart) wins.
+    #   2. Else, auto-promote a Project registered at cwd's project_hash (this
+    #      is what makes "cd into a known project, restart Claude Code"
+    #      Just Work without needing a slash command).
+    #   3. Else, no project — emit a high-visibility "register a project"
+    #      message and fall back to legacy session ids so hooks don't crash.
+    #
+    # Projects are NEVER auto-created — the user must run
+    # /cognee-memory:project-create to register one explicitly.
     import sessions as _S
 
-    project_hash = _S.compute_project_hash(cwd)
+    project_payload = await _S.resolve_active_project_for_hooks(cwd)
+
+    # Auto-promote cwd-matched project to active so the sticky cache reflects
+    # what every other hook will see. resolve_active_project_for_hooks returns
+    # the payload but doesn't promote on its own — that's a SessionStart job.
+    if project_payload:
+        sticky = _S.read_active_project_cache()
+        if not sticky or sticky.get("project_hash") != project_payload["project_hash"]:
+            promoted = await _S.set_active_project(project_payload["project_hash"])
+            if promoted:
+                project_payload = _S.read_active_project_cache() or project_payload
+
     git_branch = _S.get_git_branch(cwd)
     active_label = ""
     active_summary = ""
-    try:
-        active = await _S.ensure_active_session(
-            project_hash, project_root=cwd, git_branch=git_branch
-        )
-        session_id = str(active.id)
-        dataset = _S.dataset_name(project_hash)
-        active_label = active.label
-        active_summary = active.summary_snapshot or ""
-    except Exception as e:
-        print(
-            f"cognee-plugin: session resolution fell back to legacy ({e})",
-            file=sys.stderr,
-        )
+    project_unregistered = project_payload is None
+
+    if project_unregistered:
+        # Memory hooks become best-effort no-ops until the user registers
+        # a project. We still write resolved.json with legacy strings so the
+        # rest of the hook chain doesn't crash on missing keys.
         session_id = get_session_id(config, cwd)
         dataset = get_dataset(config)
+        print(
+            "cognee-plugin: no active project — run /cognee-memory:project-create",
+            file=sys.stderr,
+        )
+    else:
+        project_hash = project_payload["project_hash"]
+        project_root = project_payload.get("project_root", cwd)
+        try:
+            active = await _S.ensure_active_session(
+                project_hash, project_root=project_root, git_branch=git_branch
+            )
+            session_id = str(active.id)
+            dataset = _S.dataset_name(project_hash)
+            active_label = active.label
+            active_summary = active.summary_snapshot or ""
+        except Exception as e:
+            print(
+                f"cognee-plugin: session resolution fell back to legacy ({e})",
+                file=sys.stderr,
+            )
+            session_id = get_session_id(config, cwd)
+            dataset = get_dataset(config)
 
     # Write resolved values for other hooks
     _write_resolved(session_id, dataset, user_id, cwd, api_key=agent_api_key)
@@ -184,17 +219,34 @@ async def _start():
     )
 
     # Build the SessionStart context payload. Hydrates the conversation with
-    # the active session's label + persisted summary_snapshot so the agent
-    # picks up where the project left off — even if this is a fresh Claude Code
-    # process and the user hasn't yet typed a prompt.
-    session_section = (
-        f"## Active session\n"
-        f"**{active_label}** (id={session_id[:8]})"
-    )
-    if git_branch:
-        session_section += f" — branch: `{git_branch}`"
-    if active_summary:
-        session_section += f"\n\n### Where this session left off\n{active_summary}"
+    # the active project + session label + persisted summary_snapshot so the
+    # agent picks up where work left off, even on a fresh Claude Code process.
+    if project_unregistered:
+        session_section = (
+            "## ⚠ No active project for this directory\n"
+            f"`cwd` is `{cwd}`, which has no registered project.\n\n"
+            "Memory hooks are running in degraded mode (no recall, no graph "
+            "writes) until a project is registered. To start using cognee "
+            "memory, run:\n\n"
+            "    /cognee-memory:project-create\n\n"
+            "It will ask you for a project name and capture the current cwd "
+            "+ git remote as the project root. To work on a project that's "
+            "already registered, run `/cognee-memory:project-activate "
+            "<name>` instead."
+        )
+    else:
+        project_name = project_payload.get("project_name") or "(unnamed)"
+        project_root = project_payload.get("project_root") or cwd
+        session_section = (
+            f"## Active project\n"
+            f"**{project_name}** (root: `{project_root}`)\n\n"
+            f"## Active session\n"
+            f"**{active_label}** (id={session_id[:8]})"
+        )
+        if git_branch:
+            session_section += f" — branch: `{git_branch}`"
+        if active_summary:
+            session_section += f"\n\n### Where this session left off\n{active_summary}"
 
     routing = (
         "## Cognee Memory Connected\n"

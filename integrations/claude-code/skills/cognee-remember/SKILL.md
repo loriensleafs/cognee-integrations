@@ -1,42 +1,21 @@
 ---
 name: cognee-remember
-description: Store data permanently in the Cognee knowledge graph. Accepts a data category (user, project, or agent) to tag the data with the correct node_set for filtered retrieval.
+description: Store data permanently in the Cognee knowledge graph.
 ---
 
 # Cognee Permanent Memory Storage
 
-Store data permanently in the Cognee knowledge graph with category tagging.
-
-## Data categories
-
-Cognee organizes knowledge into three categories via `node_set` tagging:
-
-| Category | Node set | What belongs here |
-|----------|----------|-------------------|
-| **user** | `user_context` | User preferences, corrections, personal facts, communication style |
-| **project** | `project_docs` | Repository docs, code context, architecture decisions, company data |
-| **agent** | `agent_actions` | Tool call logs, reasoning traces, generated artifacts (auto-captured by hooks) |
+Store data permanently in the Cognee knowledge graph.
 
 ## Instructions
 
-Determine the category from the user's intent, then run:
+Run:
 
-**User data** (preferences, corrections, personal context):
 ```bash
-cognee-cli remember "$ARGUMENTS" -d "${COGNEE_PLUGIN_DATASET:-claude_sessions}" --node-set user_context
+COGNEE_SKIP_CONNECTION_TEST=true cognee-cli remember "$ARGUMENTS" -d "${COGNEE_PLUGIN_DATASET:-claude_sessions}"
 ```
 
-**Project data** (docs, code, company knowledge):
-```bash
-cognee-cli remember "$ARGUMENTS" -d "${COGNEE_PLUGIN_DATASET:-claude_sessions}" --node-set project_docs
-```
-
-**Agent data** (explicit agent notes — routine tool logs are automatic):
-```bash
-cognee-cli remember "$ARGUMENTS" -d "${COGNEE_PLUGIN_DATASET:-claude_sessions}" --node-set agent_actions
-```
-
-If the category is unclear, default to **project**.
+The `COGNEE_SKIP_CONNECTION_TEST=true` prefix bypasses cognee's 30s LLM connection test, which times out against local Ollama models (cold start ~22s + structured-output coercion exceeds the hard-coded ceiling).
 
 The command outputs a summary after completion:
 
@@ -50,21 +29,19 @@ Data ingested and knowledge graph built successfully!
 
 **IMPORTANT**: Do NOT use the `-b` (background) flag. Always run in the foreground to ensure the full pipeline completes.
 
+## Category routing (LLM-side, not enforced at storage)
+
+cognee-cli 1.0.3 does not yet expose `--node-set` on `remember`/`add` (only `search`). Until upstream parity ships, treat the categories below as routing guidance for *what to remember*, not as a stored tag:
+
+| Category | What belongs here |
+|----------|-------------------|
+| user | User preferences, corrections, personal facts, communication style |
+| project | Repository docs, code context, architecture decisions, company data |
+| agent | Reasoning traces, conclusions, discovered patterns (routine tool logs are auto-captured by hooks) |
+
 ## When to use
 
-- User says "remember this" or "save this" → category **user**
-- User says "remember this about the project/codebase" → category **project**
-- You want to persist your own findings or conclusions → category **agent**
-- NOT for routine tool call logging (that's automatic via hooks with `agent_actions` tagging)
-
-## Category routing guide
-
-| Signal | Category |
-|--------|----------|
-| "remember my preference for..." | user |
-| "I always want..." / "I prefer..." | user |
-| "remember this about the codebase" | project |
-| "save these docs" / "index this file" | project |
-| "note that this API works like..." | project |
-| "remember what we discovered" | agent |
-| Routine tool calls | agent (automatic, no action needed) |
+- User says "remember this" or "save this" → user category
+- User says "remember this about the project/codebase" → project category
+- You want to persist your own findings or conclusions → agent category
+- NOT for routine tool call logging (that's automatic via hooks)

@@ -56,13 +56,22 @@ _PROJECTS_ROOT = _PLUGIN_ROOT / "projects"
 class Project(DataPoint):
     """Logical container for a project's sessions.
 
-    ``project_hash`` is the identity field — same hash deterministically
-    produces the same UUID, so ``add_data_points`` upserts cleanly across
-    runs without us tracking which projects have been created.
+    Projects are explicit — never auto-created. Registered via the
+    ``project-create`` slash command which prompts the user for a name and
+    captures the project root + git metadata. ``project_hash`` (a stable hash
+    of the absolute project_root) is the identity field, so re-running
+    ``register_project`` for the same root upserts.
+
+    Active-project flag is sticky across Claude Code conversations so the user
+    can work on this project from any cwd until they explicitly switch.
     """
 
     name: str = ""
     project_hash: str = ""
+    project_root: str = ""
+    git_remote_url: str = ""
+    git_default_branch: str = ""
+    is_active: bool = False
     metadata: dict = {
         "index_fields": ["name"],
         "identity_fields": ["project_hash"],
@@ -216,14 +225,275 @@ async def _ensure_dataset(project_hash: str) -> None:
             pass
 
 
-# ─── Project upsert ───────────────────────────────────────────────────────
+# ─── Project: registration, lookup, active pointer ──────────────────────────
 
 
-async def get_or_create_project(project_hash: str, project_root: str) -> "Project":
-    """Idempotent: same project_hash deterministically produces same Project UUID."""
-    project = Project(name=Path(project_root).name or project_root, project_hash=project_hash)
+_ACTIVE_PROJECT_CACHE = _PLUGIN_ROOT / "active-project.json"
+
+
+def read_active_project_cache() -> Optional[dict]:
+    """Read sticky active-project pointer. None on miss."""
+    if not _ACTIVE_PROJECT_CACHE.exists():
+        return None
+    try:
+        return json.loads(_ACTIVE_PROJECT_CACHE.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def write_active_project_cache(project: "Project") -> None:
+    """Persist sticky active-project pointer atomically."""
+    _ACTIVE_PROJECT_CACHE.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "project_hash": project.project_hash,
+        "project_root": project.project_root,
+        "project_name": project.name,
+        "git_remote_url": project.git_remote_url,
+        "git_default_branch": project.git_default_branch,
+    }
+    fd, tmp_path = tempfile.mkstemp(
+        prefix=".active-project.", suffix=".tmp", dir=_ACTIVE_PROJECT_CACHE.parent
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+            f.write("\n")
+        os.replace(tmp_path, _ACTIVE_PROJECT_CACHE)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
+        raise
+
+
+def clear_active_project_cache() -> None:
+    try:
+        _ACTIVE_PROJECT_CACHE.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def get_git_remote(project_root: str) -> str:
+    """Best-effort: return ``origin`` remote URL, or ''."""
+    try:
+        result = subprocess.run(
+            ["git", "remote", "get-url", "origin"],
+            cwd=project_root,
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+    except Exception:
+        pass
+    return ""
+
+
+def get_git_default_branch(project_root: str) -> str:
+    """Detect the repo's default branch (typically main or master)."""
+    try:
+        # symbolic-ref refs/remotes/origin/HEAD → "refs/remotes/origin/main"
+        result = subprocess.run(
+            ["git", "symbolic-ref", "refs/remotes/origin/HEAD"],
+            cwd=project_root,
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        if result.returncode == 0:
+            ref = result.stdout.strip()
+            if "/" in ref:
+                return ref.rsplit("/", 1)[1]
+    except Exception:
+        pass
+    # Fallbacks
+    for candidate in ("main", "master"):
+        try:
+            result = subprocess.run(
+                ["git", "rev-parse", "--verify", candidate],
+                cwd=project_root,
+                capture_output=True,
+                text=True,
+                timeout=3,
+            )
+            if result.returncode == 0:
+                return candidate
+        except Exception:
+            pass
+    return ""
+
+
+async def register_project(
+    name: str, project_root: str, *, set_active: bool = True
+) -> "Project":
+    """Create a Project with explicit name + captured git metadata.
+
+    Idempotent via identity_fields=['project_hash']: re-running for the same
+    project_root upserts (and updates name/metadata if changed).
+
+    By default also marks this Project active and demotes any prior active.
+    """
+    if not name or not project_root:
+        raise ValueError("name and project_root are required")
+    project_root = os.path.abspath(project_root)
+    project_hash = hashlib.sha256(project_root.encode()).hexdigest()[:12]
+
+    if set_active:
+        existing = await find_active_project()
+        if existing and existing.project_hash != project_hash:
+            existing.is_active = False
+            await add_data_points([existing])
+
+    project = Project(
+        name=name,
+        project_hash=project_hash,
+        project_root=project_root,
+        git_remote_url=get_git_remote(project_root),
+        git_default_branch=get_git_default_branch(project_root),
+        is_active=bool(set_active),
+    )
     await add_data_points([project])
+
+    if set_active:
+        write_active_project_cache(project)
     return project
+
+
+def _props_to_project(props: dict) -> Optional["Project"]:
+    if not props or props.get("type") != "Project":
+        return None
+    try:
+        return Project(
+            id=UUID(str(props["id"])) if "id" in props else uuid4(),
+            name=str(props.get("name", "")),
+            project_hash=str(props.get("project_hash", "")),
+            project_root=str(props.get("project_root", "")),
+            git_remote_url=str(props.get("git_remote_url", "")),
+            git_default_branch=str(props.get("git_default_branch", "")),
+            is_active=bool(props.get("is_active", False)),
+            created_at=int(props.get("created_at", 0)),
+            updated_at=int(props.get("updated_at", 0)),
+        )
+    except Exception:
+        return None
+
+
+async def _query_projects(where: str = "", params: Optional[dict] = None,
+                          limit: int = 50) -> List["Project"]:
+    from cognee.infrastructure.databases.graph import get_graph_engine
+
+    base_where = "n.type = 'Project'"
+    full_where = f"{base_where} AND ({where})" if where else base_where
+    cypher = (
+        "MATCH (n) "
+        f"WHERE {full_where} "
+        "RETURN properties(n) AS props "
+        f"LIMIT {int(limit)}"
+    )
+    try:
+        engine = await get_graph_engine()
+        rows = await engine.query(cypher, params or {})
+    except Exception:
+        return []
+    out: List[Project] = []
+    for row in rows or []:
+        props = row.get("props") if isinstance(row, dict) else (row[0] if row else None)
+        p = _props_to_project(props)
+        if p is not None:
+            out.append(p)
+    return out
+
+
+async def find_active_project() -> Optional["Project"]:
+    """Sticky active project for this user, if one is registered."""
+    matches = await _query_projects(where="n.is_active = true", limit=1)
+    return matches[0] if matches else None
+
+
+async def find_project_by_hash(project_hash: str) -> Optional["Project"]:
+    matches = await _query_projects(
+        where="n.project_hash = $h", params={"h": project_hash}, limit=1
+    )
+    return matches[0] if matches else None
+
+
+async def find_project_by_name_query(query: str) -> List["Project"]:
+    """Substring match against Project.name (case-insensitive)."""
+    matches = await _query_projects(
+        where="toLower(n.name) CONTAINS $q",
+        params={"q": (query or "").lower()},
+        limit=10,
+    )
+    return matches
+
+
+async def list_projects() -> List["Project"]:
+    return await _query_projects(limit=100)
+
+
+async def set_active_project(project_hash: str) -> Optional["Project"]:
+    """Mark a project active, demoting any prior active. Updates cache."""
+    target = await find_project_by_hash(project_hash)
+    if not target:
+        return None
+    current = await find_active_project()
+    if current and current.project_hash != project_hash:
+        current.is_active = False
+        await add_data_points([current])
+    target.is_active = True
+    await add_data_points([target])
+    write_active_project_cache(target)
+    return target
+
+
+async def rename_active_project(name: str) -> Optional["Project"]:
+    project = await find_active_project()
+    if not project:
+        return None
+    project.name = name
+    await add_data_points([project])
+    cache = read_active_project_cache()
+    if cache:
+        cache["project_name"] = name
+        _ACTIVE_PROJECT_CACHE.write_text(json.dumps(cache, indent=2) + "\n", encoding="utf-8")
+    return project
+
+
+async def resolve_active_project_for_hooks(cwd: Optional[str] = None) -> Optional[dict]:
+    """Resolver hooks call before any project-scoped operation.
+
+    Order:
+      1. Sticky active-project cache (persists across Claude Code sessions)
+      2. Cognee active flag (matches cache 99% of the time)
+      3. Cognee Project at cwd's project_hash, if registered
+      4. None — caller should signal "no project; user must run /cognee-memory:project-create"
+    """
+    cache = read_active_project_cache()
+    if cache and cache.get("project_hash"):
+        return cache
+
+    active = await find_active_project()
+    if active:
+        write_active_project_cache(active)
+        return read_active_project_cache()
+
+    if cwd is None:
+        cwd = os.environ.get("CLAUDE_CWD", os.getcwd())
+    cwd = os.path.abspath(cwd)
+    cwd_hash = hashlib.sha256(cwd.encode()).hexdigest()[:12]
+    cwd_project = await find_project_by_hash(cwd_hash)
+    if cwd_project:
+        # Don't auto-promote to active — that's a deliberate user choice.
+        return {
+            "project_hash": cwd_project.project_hash,
+            "project_root": cwd_project.project_root,
+            "project_name": cwd_project.name,
+            "git_remote_url": cwd_project.git_remote_url,
+            "git_default_branch": cwd_project.git_default_branch,
+        }
+    return None
 
 
 # ─── Cognee-backed session queries ────────────────────────────────────────
@@ -372,7 +642,12 @@ async def create_session(
     if not label:
         label = f"untitled-{secrets.token_hex(4)}"
 
-    project = await get_or_create_project(project_hash, project_root)
+    project = await find_project_by_hash(project_hash)
+    if not project:
+        raise ValueError(
+            f"No Project registered for project_hash={project_hash}. "
+            "Register one via /cognee-memory:project-create before creating sessions."
+        )
 
     if set_active_flag:
         # Demote any existing ACTIVE in this project before promoting ours.
