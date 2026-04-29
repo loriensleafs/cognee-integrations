@@ -140,12 +140,14 @@ async def _start():
     except Exception as e:
         print(f"cognee-plugin: identity warning ({e})", file=sys.stderr)
 
-    # Resolve the active project + session. Resolver order:
-    #   1. Sticky active-project pointer (set by /cognee-memory:project-activate
-    #      or a prior SessionStart) wins.
-    #   2. Else, auto-promote a Project registered at cwd's project_hash (this
-    #      is what makes "cd into a known project, restart Claude Code"
-    #      Just Work without needing a slash command).
+    # Resolve the active project + session. Resolver order (cwd is the
+    # strongest signal — explicit user navigation beats prior sticky state):
+    #   1. cwd → registered Project? Use it. Promote to active so subsequent
+    #      hooks see consistent state and the sticky cache stays current.
+    #      This means "cd into project A, restart Claude Code" auto-switches
+    #      out of any prior sticky project B without a slash command.
+    #   2. Else, sticky active-project pointer (covers the "I'm in a parent
+    #      dir, keep working on the project I set last time" case).
     #   3. Else, no project — emit a high-visibility "register a project"
     #      message and fall back to legacy session ids so hooks don't crash.
     #
@@ -155,9 +157,10 @@ async def _start():
 
     project_payload = await _S.resolve_active_project_for_hooks(cwd)
 
-    # Auto-promote cwd-matched project to active so the sticky cache reflects
-    # what every other hook will see. resolve_active_project_for_hooks returns
-    # the payload but doesn't promote on its own — that's a SessionStart job.
+    # Always reconcile sticky cache to whatever the resolver returned. If cwd
+    # picked a different project than was previously sticky, the cwd-match wins
+    # and we promote the cwd project to active. If sticky and resolver agree,
+    # set_active_project is a no-op.
     if project_payload:
         sticky = _S.read_active_project_cache()
         if not sticky or sticky.get("project_hash") != project_payload["project_hash"]:

@@ -461,15 +461,46 @@ async def rename_active_project(name: str) -> Optional["Project"]:
     return project
 
 
+def _project_to_payload(project: "Project") -> dict:
+    return {
+        "project_hash": project.project_hash,
+        "project_root": project.project_root,
+        "project_name": project.name,
+        "git_remote_url": project.git_remote_url,
+        "git_default_branch": project.git_default_branch,
+    }
+
+
 async def resolve_active_project_for_hooks(cwd: Optional[str] = None) -> Optional[dict]:
     """Resolver hooks call before any project-scoped operation.
 
+    cwd is the strongest signal — if you've ``cd``'d into a registered
+    project, that's an explicit "I want to work on this" gesture and
+    overrides any prior sticky selection. Sticky only kicks in when cwd
+    doesn't match a known project (e.g., a parent directory).
+
     Order:
-      1. Sticky active-project cache (persists across Claude Code sessions)
-      2. Cognee active flag (matches cache 99% of the time)
-      3. Cognee Project at cwd's project_hash, if registered
-      4. None — caller should signal "no project; user must run /cognee-memory:project-create"
+      1. cwd → Project registered at sha256(abspath(cwd))[:12]? Use it.
+         Caller (SessionStart) will promote to active so subsequent hooks
+         see consistent state.
+      2. Sticky active-project cache (persists across Claude Code sessions
+         — covers the "I'm in a parent dir, keep working on the project I
+         set last time" case).
+      3. Cognee active flag (recovery if cache file was deleted).
+      4. None — caller signals "register a project first".
     """
+    if cwd is None:
+        cwd = os.environ.get("CLAUDE_CWD", os.getcwd())
+    cwd = os.path.abspath(cwd)
+    cwd_hash = hashlib.sha256(cwd.encode()).hexdigest()[:12]
+
+    cwd_project = await find_project_by_hash(cwd_hash)
+    if cwd_project and cwd_project.project_root:
+        # Skip ghost Project nodes from before explicit registration (they
+        # have name+hash but no project_root). The resolver falls through
+        # to sticky as if no project were registered for this cwd.
+        return _project_to_payload(cwd_project)
+
     cache = read_active_project_cache()
     if cache and cache.get("project_hash"):
         return cache
@@ -477,22 +508,8 @@ async def resolve_active_project_for_hooks(cwd: Optional[str] = None) -> Optiona
     active = await find_active_project()
     if active:
         write_active_project_cache(active)
-        return read_active_project_cache()
+        return _project_to_payload(active)
 
-    if cwd is None:
-        cwd = os.environ.get("CLAUDE_CWD", os.getcwd())
-    cwd = os.path.abspath(cwd)
-    cwd_hash = hashlib.sha256(cwd.encode()).hexdigest()[:12]
-    cwd_project = await find_project_by_hash(cwd_hash)
-    if cwd_project:
-        # Don't auto-promote to active — that's a deliberate user choice.
-        return {
-            "project_hash": cwd_project.project_hash,
-            "project_root": cwd_project.project_root,
-            "project_name": cwd_project.name,
-            "git_remote_url": cwd_project.git_remote_url,
-            "git_default_branch": cwd_project.git_default_branch,
-        }
     return None
 
 
