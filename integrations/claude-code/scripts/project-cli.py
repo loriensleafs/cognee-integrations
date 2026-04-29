@@ -201,11 +201,48 @@ async def cmd_rename(args: List[str]) -> int:
     return 0
 
 
+async def cmd_cleanup_ghosts(_args: List[str]) -> int:
+    """Delete Project DataPoints with empty project_root (legacy auto-created
+    ghosts from before explicit registration). Idempotent."""
+    await _bootstrap()
+    from cognee.infrastructure.databases.graph import get_graph_engine
+
+    engine = await get_graph_engine()
+    rows = await engine.query(
+        """MATCH (p) WHERE p.type = 'Project'
+           AND (p.project_root IS NULL OR p.project_root = '')
+           RETURN p.project_hash AS h, p.name AS n""",
+        {},
+    )
+    if not rows:
+        print("No ghost projects found.")
+        return 0
+    print(f"Found {len(rows)} ghost project(s):")
+    for r in rows:
+        print(f"  {r.get('h', '?')} — {r.get('n', '(unnamed)')}")
+    print()
+
+    deleted = await engine.query(
+        """MATCH (p) WHERE p.type = 'Project'
+           AND (p.project_root IS NULL OR p.project_root = '')
+           DETACH DELETE p
+           RETURN count(*) AS n""",
+        {},
+    )
+    n = 0
+    for r in deleted or []:
+        n = r.get("n") if isinstance(r, dict) else (r[0] if r else 0)
+        break
+    print(f"Deleted {n} ghost project(s).")
+    return 0
+
+
 _COMMANDS = {
     "list": cmd_list,
     "create": cmd_create,
     "activate": cmd_activate,
     "rename": cmd_rename,
+    "cleanup-ghosts": cmd_cleanup_ghosts,
 }
 
 
