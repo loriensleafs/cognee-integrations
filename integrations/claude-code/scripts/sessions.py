@@ -29,7 +29,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 from typing import Any, List, Optional
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from cognee.infrastructure.engine import DataPoint
 from cognee.tasks.storage import add_data_points
@@ -174,40 +174,111 @@ def clear_cache(project_hash: str) -> None:
 # ─── Cognee-backed operations ─────────────────────────────────────────────
 
 
-def _extract_sessions(results: Any) -> List["Session"]:
-    """Unwrap cognee.search results to extract Session DataPoint instances."""
-    out: List[Session] = []
-    for r in results or []:
-        if isinstance(r, Session):
-            out.append(r)
-            continue
-        # SearchResult variants may wrap the node in `.datapoint` or `.node`
-        candidate = getattr(r, "datapoint", None) or getattr(r, "node", None)
-        if isinstance(candidate, Session):
-            out.append(candidate)
-    return out
+_AGENT_EMAIL = "claude-code@cognee.agent"
+
+
+async def _get_agent_user():
+    """Return the agent User (claude-code@cognee.agent), or default if unavailable.
+
+    The Cognee Claude Code plugin operates under a dedicated agent identity
+    registered in ``ensure_identity``. Sessions DataPoints + datasets must be
+    owned and queried by that same user to avoid permission mismatches.
+    """
+    from cognee.modules.users.methods import get_default_user, get_user_by_email
+
+    user = await get_user_by_email(_AGENT_EMAIL)
+    if user is not None:
+        return user
+    return await get_default_user()
+
+
+async def _ensure_dataset(project_hash: str) -> None:
+    """Idempotently create the project's cognee dataset and grant the agent
+    user read/write/delete/share permissions on it.
+
+    ``add_data_points`` writes graph nodes but does *not* register the dataset
+    in cognee's relational metadata, so a fresh project would 404 on
+    ``cognee.search``. Permission grants are required for the agent user to
+    query the dataset back later.
+    """
+    from cognee.modules.data.methods.create_dataset import create_dataset
+    from cognee.modules.users.permissions.methods import give_permission_on_dataset
+
+    user = await _get_agent_user()
+    if user is None:
+        return
+    dataset = await create_dataset(dataset_name(project_hash), user)
+    for perm in ("read", "write", "delete", "share"):
+        try:
+            await give_permission_on_dataset(user, dataset.id, perm)
+        except Exception:
+            # Idempotent: ACL already exists, etc.
+            pass
+
+
+def _props_to_session(props: dict) -> Optional["Session"]:
+    """Reconstruct a Session DataPoint from a graph node's stored properties."""
+    if not props or props.get("type") != "Session":
+        return None
+    try:
+        return Session(
+            id=UUID(str(props["id"])) if "id" in props else uuid4(),
+            label=str(props.get("label", "")),
+            started_at=str(props.get("started_at", "")),
+            ended_at=props.get("ended_at"),
+            git_branch=str(props.get("git_branch", "")),
+            summary_snapshot=str(props.get("summary_snapshot", "")),
+            auto_named=bool(props.get("auto_named", True)),
+            turn_count=int(props.get("turn_count", 0)),
+            belongs_to_set=list(props.get("belongs_to_set") or []),
+            created_at=int(props.get("created_at", 0)),
+            updated_at=int(props.get("updated_at", 0)),
+        )
+    except Exception:
+        return None
 
 
 async def _query_sessions(
     project_hash: str,
     nodesets: List[str],
-    query_text: str = "session",
+    query_text: str = "session",  # retained for signature compat; unused
     top_k: int = 50,
 ) -> List["Session"]:
-    """Find Session DataPoints in this project filtered by nodesets."""
-    import cognee
-    from cognee.modules.search.types.SearchType import SearchType
+    """Find Session DataPoints filtered by nodeset membership.
 
-    results = await cognee.search(
-        query_text=query_text,
-        query_type=SearchType.CHUNKS,
-        datasets=[dataset_name(project_hash)],
-        node_type=Session,
-        node_name=nodesets,
-        node_name_filter_operator="AND",
-        top_k=top_k,
+    Uses direct Cypher via the graph engine because ``cognee.search`` with
+    ``query_type=CHUNKS`` returns vector-index rows (IndexSchema), not the
+    underlying DataPoint instances. The Cypher ``ALL`` predicate matches the
+    AND semantics we want: a session must have every requested nodeset plus
+    the project nodeset.
+    """
+    from cognee.infrastructure.databases.graph import get_graph_engine
+
+    await _ensure_dataset(project_hash)
+
+    required = list(nodesets) + [project_nodeset(project_hash)]
+
+    cypher = (
+        "MATCH (n) "
+        "WHERE n.type = 'Session' "
+        "AND ALL(ns IN $required WHERE ns IN n.belongs_to_set) "
+        "RETURN properties(n) AS props "
+        f"LIMIT {int(top_k)}"
     )
-    return _extract_sessions(results)
+
+    try:
+        engine = await get_graph_engine()
+        rows = await engine.query(cypher, {"required": required})
+    except Exception:
+        return []
+
+    sessions: List[Session] = []
+    for row in rows or []:
+        props = row.get("props") if isinstance(row, dict) else row[0] if row else None
+        s = _props_to_session(props)
+        if s is not None:
+            sessions.append(s)
+    return sessions
 
 
 async def find_active_session(project_hash: str) -> Optional["Session"]:

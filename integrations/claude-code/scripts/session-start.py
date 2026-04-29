@@ -126,10 +126,7 @@ async def _start():
     config = load_config()
     cwd = os.environ.get("CLAUDE_CWD", os.getcwd())
 
-    session_id = get_session_id(config, cwd)
-    dataset = get_dataset(config)
-
-    # Configure cognee (cloud or local)
+    # Configure cognee (cloud or local) — must happen before any DataPoint write.
     try:
         await ensure_cognee_ready(config)
     except Exception as e:
@@ -142,6 +139,30 @@ async def _start():
         user_id, agent_api_key = await ensure_identity(config)
     except Exception as e:
         print(f"cognee-plugin: identity warning ({e})", file=sys.stderr)
+
+    # Resolve the active session for this project. Auto-creates an
+    # ``untitled-<short>`` placeholder on first cwd visit.
+    import sessions as _S
+
+    project_hash = _S.compute_project_hash(cwd)
+    git_branch = _S.get_git_branch(cwd)
+    active_label = ""
+    active_summary = ""
+    try:
+        active = await _S.ensure_active_session(
+            project_hash, project_root=cwd, git_branch=git_branch
+        )
+        session_id = str(active.id)
+        dataset = _S.dataset_name(project_hash)
+        active_label = active.label
+        active_summary = active.summary_snapshot or ""
+    except Exception as e:
+        print(
+            f"cognee-plugin: session resolution fell back to legacy ({e})",
+            file=sys.stderr,
+        )
+        session_id = get_session_id(config, cwd)
+        dataset = get_dataset(config)
 
     # Write resolved values for other hooks
     _write_resolved(session_id, dataset, user_id, cwd, api_key=agent_api_key)
@@ -162,28 +183,42 @@ async def _start():
         file=sys.stderr,
     )
 
-    # Inject system guidance so Claude knows how to route data
+    # Build the SessionStart context payload. Hydrates the conversation with
+    # the active session's label + persisted summary_snapshot so the agent
+    # picks up where the project left off — even if this is a fresh Claude Code
+    # process and the user hasn't yet typed a prompt.
+    session_section = (
+        f"## Active session\n"
+        f"**{active_label}** (id={session_id[:8]})"
+    )
+    if git_branch:
+        session_section += f" — branch: `{git_branch}`"
+    if active_summary:
+        session_section += f"\n\n### Where this session left off\n{active_summary}"
+
+    routing = (
+        "## Cognee Memory Connected\n"
+        f"Mode: {mode} | Dataset: {dataset}\n\n"
+        "Cognee organizes knowledge into three categories. "
+        "When storing data with /cognee-memory:cognee-remember, "
+        "route to the correct category:\n\n"
+        "- **user_context** — user preferences, corrections, personal facts, "
+        "communication style. Use when the user says 'remember my preference', "
+        "'I always want', or shares personal details.\n"
+        "- **project_docs** — repository docs, code context, architecture decisions, "
+        "company data. Use when storing codebase knowledge, API docs, or project context.\n"
+        "- **agent_actions** — reasoning traces, conclusions, discovered patterns. "
+        "Use when you want to persist your own findings. "
+        "Routine tool call logging is automatic (no action needed).\n\n"
+        "When searching with /cognee-memory:cognee-search, you can filter by category "
+        "using --node-set (user_context, project_docs, or agent_actions).\n"
+        "If unsure which category, default to project_docs."
+    )
+
     guidance = {
         "hookSpecificOutput": {
             "hookEventName": "SessionStart",
-            "systemMessage": (
-                "## Cognee Memory Connected\n"
-                f"Mode: {mode} | Dataset: {dataset} | Session: {session_id}\n\n"
-                "Cognee organizes knowledge into three categories. "
-                "When storing data with /cognee-memory:cognee-remember, "
-                "route to the correct category:\n\n"
-                "- **user_context** — user preferences, corrections, personal facts, "
-                "communication style. Use when the user says 'remember my preference', "
-                "'I always want', or shares personal details.\n"
-                "- **project_docs** — repository docs, code context, architecture decisions, "
-                "company data. Use when storing codebase knowledge, API docs, or project context.\n"
-                "- **agent_actions** — reasoning traces, conclusions, discovered patterns. "
-                "Use when you want to persist your own findings. "
-                "Routine tool call logging is automatic (no action needed).\n\n"
-                "When searching with /cognee-memory:cognee-search, you can filter by category "
-                "using --node-set (user_context, project_docs, or agent_actions).\n"
-                "If unsure which category, default to project_docs."
-            ),
+            "systemMessage": session_section + "\n\n" + routing,
         }
     }
     print(json.dumps(guidance))
