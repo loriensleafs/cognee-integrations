@@ -73,6 +73,19 @@
           }
         ]
       }
+    ],
+    "FileChanged": [
+      {
+        "matcher": "\\.git/HEAD$|\\.git/refs/heads/main$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ${CLAUDE_PLUGIN_ROOT}/scripts/post-git-state-change.py",
+            "timeout": 15,
+            "statusMessage": "Reacting to git state change..."
+          }
+        ]
+      }
     ]
   }
 }
