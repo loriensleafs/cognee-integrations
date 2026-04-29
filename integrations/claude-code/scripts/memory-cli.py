@@ -214,14 +214,30 @@ async def cmd_recall(args: argparse.Namespace) -> int:
     scope = [s.strip() for s in args.scope.split(",") if s.strip()]
 
     import cognee
+    from _plugin_common import resolve_user, load_resolved
 
-    results = await cognee.recall(
-        query,
-        session_id=session_id,
-        datasets=[S.dataset_name(project["project_hash"])],
-        top_k=args.top_k,
-        scope=scope,
-    )
+    resolved = load_resolved()
+    user = await resolve_user(resolved.get("user_id", ""))
+
+    # Per cognee 1.0 docs: passing ``session_id`` WITHOUT ``datasets``
+    # routes recall through the session-cache keyword path. Passing
+    # both forces the graph-only path, which 404s if the dataset
+    # hasn't been improve()'d yet. The session-cache path falls
+    # through to graph automatically when no session matches are found,
+    # so omitting ``datasets`` is the correct way to get hybrid
+    # session+graph results.
+    kwargs: dict = {
+        "session_id": session_id,
+        "top_k": args.top_k,
+        "scope": scope,
+        "user": user,
+    }
+    # Only pass ``datasets`` when the caller explicitly asked for the
+    # graph-only path (scope contains 'graph' AND no session-cache scopes).
+    if scope == ["graph"]:
+        kwargs["datasets"] = [S.dataset_name(project["project_hash"])]
+
+    results = await cognee.recall(query, **kwargs)
     if not results:
         print("(no recall matches)")
         return 0
