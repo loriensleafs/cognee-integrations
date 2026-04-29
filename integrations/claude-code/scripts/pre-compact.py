@@ -214,6 +214,20 @@ async def _run():
     )
     anchor = header + "\n\n".join(sections)
 
+    # Persist the anchor as the active session's summary_snapshot so future
+    # SessionStart hooks (cold start in this cwd) and /session-activate
+    # operations can hydrate the conversation with it. Best-effort — failures
+    # never block the anchor itself from reaching the compactor.
+    try:
+        import sessions as _S
+
+        cwd = os.environ.get("CLAUDE_CWD", os.getcwd())
+        project_hash = _S.compute_project_hash(cwd)
+        wrote = await _S.update_summary_snapshot(project_hash, anchor)
+        hook_log("precompact_snapshot_persisted", {"wrote": wrote})
+    except Exception as exc:
+        hook_log("precompact_snapshot_error", {"error": str(exc)[:200]})
+
     hook_log(
         "precompact_anchor",
         {
