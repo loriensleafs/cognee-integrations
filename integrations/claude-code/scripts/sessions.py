@@ -714,16 +714,83 @@ async def set_active(
     return target
 
 
+async def sync_session_to_graph(project_hash: str, session_id: str) -> bool:
+    """Bridge a session's QA cache entries into the permanent graph.
+
+    Calls ``cognee.improve(session_ids=[session_id])`` which:
+      1. Applies feedback weights from session scores
+      2. Persists the session's QA entries into the permanent graph
+      3. Runs default enrichment (triplet embeddings)
+      4. Syncs the resulting graph context back into the session cache
+
+    Tries the running cognee HTTP backend first to avoid Kuzu's single-writer
+    lock when a backend is up; falls back to the SDK if the HTTP path is not
+    reachable. Best-effort — returns False on failure but never raises so
+    callers (end_session, auto-end on PR merge, manual /session-end) don't
+    have to wrap it in their own try/except.
+
+    Notes on persistence guarantees:
+      - The Session entity is already in the graph (via ``add_data_points``)
+        before this is called. Lifecycle queries work correctly even if
+        improve hasn't completed yet.
+      - The active.json cache is unrelated infrastructure, cleared by
+        ``end_session`` separately. ``cognee.improve`` reads from cognee's
+        own QA cache, which is a different store with a TTL.
+    """
+    import cognee
+
+    dataset = dataset_name(project_hash)
+
+    # HTTP path first — safe under Kuzu single-writer lock when a backend
+    # is running. Lazy import keeps cold-start light.
+    try:
+        from _plugin_common import improve_via_http
+
+        if improve_via_http(dataset, session_id, run_in_background=True):
+            return True
+    except Exception:
+        pass
+
+    # SDK fallback for when no backend is running (dev/tests).
+    try:
+        user = await _get_agent_user()
+        await cognee.improve(
+            dataset=dataset,
+            session_ids=[session_id],
+            run_in_background=True,
+            user=user,
+        )
+        return True
+    except Exception:
+        return False
+
+
 async def end_session(
-    project_hash: str, session_id: Optional[str] = None
+    project_hash: str,
+    session_id: Optional[str] = None,
+    *,
+    sync_to_graph: bool = True,
 ) -> Optional["Session"]:
-    """End a session (defaults to active). Sets status='ENDED', is_active=false, ended_at=now."""
+    """End a session (defaults to active). Sets status='ENDED', is_active=false, ended_at=now.
+
+    By default also fires ``cognee.improve()`` (background) so the session's
+    QA cache entries land in the permanent graph automatically. Pass
+    ``sync_to_graph=False`` to skip the bridge — useful for tests and for
+    bulk-ending where ``end_sessions_bulk`` triggers improve once at the end.
+
+    Idempotent on double-end: if the session is already ENDED, returns it
+    immediately without re-running the bridge or rewriting timestamps.
+    """
     if session_id:
         session = await find_session_by_id(project_hash, session_id)
     else:
         session = await find_active_session(project_hash)
     if not session:
         return None
+
+    # Idempotency guard — already-ended sessions short-circuit.
+    if session.status == "ENDED" and not session.is_active:
+        return session
 
     session.status = "ENDED"
     session.is_active = False
@@ -733,7 +800,46 @@ async def end_session(
     cache = read_cache(project_hash)
     if cache and cache.get("session_id") == str(session.id):
         clear_cache(project_hash)
+
+    if sync_to_graph:
+        # Fire-and-forget: the bridge swallows its own failures, so we
+        # don't wrap. We don't await graph completion — end_session
+        # returns once the work is queued (HTTP) or kicked off (SDK).
+        await sync_session_to_graph(project_hash, str(session.id))
+
     return session
+
+
+async def end_sessions_bulk(
+    project_hash: str, session_ids: List[str]
+) -> List["Session"]:
+    """End multiple sessions, then sync them all in a single improve call.
+
+    Skips the per-session bridge (``sync_to_graph=False``) and fires one
+    ``cognee.improve`` for all ended session_ids at the end. Use when
+    bulk-cleaning paused sessions or during plugin teardown.
+    """
+    ended: List[Session] = []
+    for sid in session_ids:
+        session = await end_session(project_hash, sid, sync_to_graph=False)
+        if session:
+            ended.append(session)
+
+    if ended:
+        try:
+            import cognee
+
+            user = await _get_agent_user()
+            await cognee.improve(
+                dataset=dataset_name(project_hash),
+                session_ids=[str(s.id) for s in ended],
+                run_in_background=True,
+                user=user,
+            )
+        except Exception:
+            pass
+
+    return ended
 
 
 async def rename_session(

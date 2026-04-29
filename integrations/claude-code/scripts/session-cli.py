@@ -46,13 +46,22 @@ def _fmt_session(s: "S.Session", active_id: Optional[str] = None) -> str:
 
 
 async def _bootstrap() -> tuple[str, str]:
-    """Initialize cognee + agent identity and return (project_hash, cwd)."""
+    """Initialize cognee + agent identity and return (project_hash, project_root).
+
+    Uses the resolver so session-cli operates on the active project (which
+    may differ from cwd — e.g. when the user is in a parent directory but
+    has a sticky active project set).
+    """
     config = load_config()
     await ensure_cognee_ready(config)
     await ensure_identity(config)
     cwd = os.environ.get("CLAUDE_CWD", os.getcwd())
-    project_hash = S.compute_project_hash(cwd)
-    return project_hash, cwd
+    payload = await S.resolve_active_project_for_hooks(cwd)
+    if payload:
+        return payload["project_hash"], payload.get("project_root", cwd)
+    # No active project — fall through with cwd-derived hash so callers can
+    # detect the empty-project case (find_active_session returns None).
+    return S.compute_project_hash(cwd), cwd
 
 
 async def cmd_list(_args: List[str]) -> int:

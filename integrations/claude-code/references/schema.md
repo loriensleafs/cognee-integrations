@@ -245,3 +245,32 @@ Source of truth is the cognee graph (`is_active=true` flag on Project /
 Session). Caches are rewritten on every state change. SessionStart
 reconciles cache against graph and re-promotes if there's a cwd-match
 mismatch.
+
+---
+
+## Three storage layers (read this before reasoning about persistence)
+
+The most common reasoning mistake when working with this code is conflating
+"the cache" — there are **two** of them, and only one is what `improve` drains:
+
+| Layer | What it holds | Persistence | Cleanup / drain |
+|---|---|---|---|
+| `active.json` (local file) | Active session pointer | Until manually cleared | Cleared by `end_session` (unrelated to graph sync) |
+| Cognee QA cache | `remember`/`recall` entries, conversational turns | TTL (default 24h) | **Drained into permanent graph by `cognee.improve`** |
+| Cognee permanent graph | `Session` / `Note` / `Observation` / `Relation` entities, content nodes, embeddings, edges | Durable | Receives `improve` output |
+
+Key facts:
+
+- The `Session` entity itself lives in the **permanent graph** from the
+  moment it's created — `add_data_points` writes it. So Cypher queries
+  for "all ENDED sessions in this project" are correct immediately after
+  `end_session` returns.
+- The session's **conversational content** (QA cache entries) is what
+  needs the bridge. Without `cognee.improve`, those entries expire on
+  TTL and never make it to the durable graph.
+- `clear_cache(project_hash)` clears the **first** layer. `cognee.improve`
+  drains the **second** layer. They don't interact.
+
+`end_session(sync_to_graph=True)` (the default) runs the bridge. The
+`sync_to_graph=False` escape hatch is for tests and the bulk path
+(`end_sessions_bulk`); production lifecycle code should always sync.
